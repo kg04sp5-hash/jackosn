@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR</title>
+<style>
+  body { margin: 0; background: #1d1f26; color: #e8e8ec; font-family: system-ui, sans-serif; }
+  #ui { position: fixed; top: 0; left: 0; right: 0; padding: 12px; background: rgba(20,22,28,.85); z-index: 10; }
+  #ui label { display: inline-block; padding: 12px 16px; background: #3b6fd8; border-radius: 8px; cursor: pointer; }
+  #ui input { display: none; }
+  #status { margin-left: 12px; font-size: 15px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>Wczytaj model (.glb)<input type="file" id="file" accept=".glb" multiple></label>
+  <span id="status">Nie wczytano modeli</span>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ===== USTAWIENIA =====
+const MODELS = [];              // opcjonalnie pliki na serwerze, np. ['models/scena.glb']
+const MOVE_SPEED = 2;           // m/s
+const SNAP_ANGLE = Math.PI / 6; // 30°
+const DEAD = 0.2;               // martwa strefa gałki
+
+// ===== SCENA =====
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202028);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.6, 0);
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(2, 4, 1);
+scene.add(sun);
+
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshStandardMaterial({ color: 0x3a3a44 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+scene.add(new THREE.GridHelper(20, 20, 0x555566, 0x2c2c36));
+
+const grabbables = new THREE.Group();
+scene.add(grabbables);
+
+// Kostki testowe
+for (let i = 0; i < 3; i++) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(.2, .2, .2),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(i / 3, .6, .5) }));
+  m.position.set(-.4 + i * .4, 1, -1);
+  grabbables.add(m);
+}
+
+// ===== KONTROLERY =====
+const factory = new XRControllerModelFactory();
+const raycaster = new THREE.Raycaster();
+const rotMat = new THREE.Matrix4();
+const controllers = [];
+
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.addEventListener('connected', e => { c.userData.hand = e.data.handedness; });
+  c.addEventListener('disconnected', () => { c.userData.hand = null; });
+  c.addEventListener('selectstart', grab);
+  c.addEventListener('squeezestart', grab);
+  c.addEventListener('selectend', release);
+  c.addEventListener('squeezeend', release);
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff }));
+  line.scale.z = 5;
+  c.add(line);
+  rig.add(c);
+
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(factory.createControllerModel(grip));
+  rig.add(grip);
+  controllers.push(c);
+}
+
+function grab(e) {
+  const c = e.target;
+  if (c.userData.held) return;
+  rotMat.identity().extractRotation(c.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(rotMat);
+  const hit = raycaster.intersectObjects(grabbables.children, true)[0];
+  if (!hit) return;
+  let obj = hit.object;
+  while (obj.parent !== grabbables) obj = obj.parent;
+  c.attach(obj);
+  c.userData.held = obj;
+}
+
+function release(e) {
+  const c = e.target;
+  if (!c.userData.held) return;
+  grabbables.attach(c.userData.held);
+  c.userData.held = null;
+}
+
+// ===== STEROWANIE =====
+const UP = new THREE.Vector3(0, 1, 0);
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), camPos = new THREE.Vector3();
+let snapReady = true;
+
+function handleInput(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp || gp.axes.length < 4) continue;
+    const x = Math.abs(gp.axes[2]) > DEAD ? gp.axes[2] : 0;
+    const y = Math.abs(gp.axes[3]) > DEAD ? gp.axes[3] : 0;
+    const c = controllers.find(k => k.userData.hand === src.handedness);
+    const held = c && c.userData.held;
+
+    if (held) {
+      // Trzymany obiekt: góra/dół = odległość, lewo/prawo = skala
+      held.position.z += y * dt * 1.5;
+      held.scale.multiplyScalar(1 + x * dt);
+    } else if (src.handedness === 'left') {
+      camera.getWorldDirection(fwd);
+      fwd.y = 0; fwd.normalize();
+      right.crossVectors(fwd, UP);
+      rig.position.addScaledVector(fwd, -y * MOVE_SPEED * dt);
+      rig.position.addScaledVector(right, x * MOVE_SPEED * dt);
+    } else if (src.handedness === 'right') {
+      if (x === 0) snapReady = true;
+      else if (snapReady) {
+        snapReady = false;
+        const a = x > 0 ? -SNAP_ANGLE : SNAP_ANGLE;
+        camera.getWorldPosition(camPos);
+        rig.position.sub(camPos).applyAxisAngle(UP, a).add(camPos);
+        rig.rotateY(a);
+      }
+    }
+  }
+}
+
+// ===== MODELE =====
+const loader = new GLTFLoader();
+const mixers = [];
+const statusEl = document.getElementById('status');
+let loaded = 0;
+
+function addModel(url, name) {
+  statusEl.textContent = 'Wczytywanie: ' + name;
+  loader.load(url, gltf => {
+    const o = gltf.scene;
+    let box = new THREE.Box3().setFromObject(o);
+    const size = box.getSize(new THREE.Vector3()).length();
+    if (size > 10 || size < 0.1) { o.scale.setScalar(1.5 / size); box = new THREE.Box3().setFromObject(o); }
+    camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+    camera.getWorldPosition(camPos);
+    const target = camPos.clone().addScaledVector(fwd, 1.5);
+    const center = box.getCenter(new THREE.Vector3());
+    o.position.x += target.x - center.x;
+    o.position.z += target.z - center.z;
+    o.position.y -= box.min.y;
+    grabbables.add(o);
+    if (gltf.animations.length) {
+      const m = new THREE.AnimationMixer(o);
+      m.clipAction(gltf.animations[0]).play();
+      mixers.push(m);
+    }
+    loaded++;
+    statusEl.textContent = 'Wczytane modele: ' + loaded;
+  }, undefined, err => {
+    statusEl.textContent = 'Nie udało się wczytać ' + name + '. Sprawdź, czy to poprawny plik .glb.';
+    console.error(err);
+  });
+}
+
+MODELS.forEach(u => addModel(u, u));
+document.getElementById('file').addEventListener('change', e => {
+  for (const f of e.target.files) addModel(URL.createObjectURL(f), f.name);
+  e.target.value = '';
+});
+
+// ===== PĘTLA =====
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  handleInput(dt);
+  for (const m of mixers) m.update(dt);
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
